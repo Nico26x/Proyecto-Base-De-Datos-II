@@ -1,0 +1,32 @@
+# Python & Entornos Virtuales
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Archivos de Configuración y Claves
+scripts_python/config.py
+*.env
+*.json
+*.pem
+
+# Archivos Temporales de Sistema / IDEs
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Frontend & Backend (Futuro)
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+backend/__pycache__/
+backend/.venv/
+
+# Base de Datos (Logs o dumps pesados)
+*.log
+*.dmp
+*.bak
