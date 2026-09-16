@@ -30,3 +30,5 @@ backend/.venv/
 *.log
 *.dmp
 *.bak
+
+scripts_python/config.py
