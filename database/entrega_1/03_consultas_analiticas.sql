@@ -25,39 +25,129 @@ ORDER BY municipio;
 
 
 -- 2. INGRESOS POR MUNICIPIO, TIPO DE ALOJAMIENTO Y TEMPORADA (ROLLUP CON GROUPING)
+-- Reporte basado en el valor registrado de las estadías (RESERVA_HABITACION.SUBTOTAL_CALCULADO),
+-- no en una reconstrucción por tarifas históricas.
+-- Convención: las temporadas cuyo nombre inicia por 'Temporada Baja' tienen menor prioridad;
+-- las demás temporadas se tratan como especiales y prevalecen cuando hay solapamientos.
+WITH NochesReserva AS (
+    SELECT m.id_municipio,
+           m.nombre AS municipio,
+           ta.id_tipo_alojamiento,
+           ta.nombre AS tipo_alojamiento,
+           rh.id_reserva_habitacion,
+           rh.subtotal_calculado / NULLIF(TRUNC(rh.fecha_checkout) - TRUNC(rh.fecha_checkin), 0) AS ingreso_noche,
+           TRUNC(rh.fecha_checkin) + n.n - 1 AS fecha_noche
+    FROM reserva_habitacion rh
+    JOIN habitacion h ON rh.id_habitacion = h.id_habitacion
+    JOIN alojamiento a ON h.id_alojamiento = a.id_alojamiento
+    JOIN municipio m ON a.id_municipio = m.id_municipio
+    JOIN tipo_alojamiento ta ON a.id_tipo_alojamiento = ta.id_tipo_alojamiento
+    CROSS JOIN LATERAL (
+        SELECT LEVEL AS n
+        FROM dual
+        CONNECT BY LEVEL <= TRUNC(rh.fecha_checkout) - TRUNC(rh.fecha_checkin)
+    ) n
+),
+CandidatasTemporada AS (
+    SELECT nr.*,
+           temp.id_temporada,
+           temp.nombre AS temporada,
+           CASE
+               WHEN temp.id_temporada IS NULL THEN NULL
+               WHEN UPPER(temp.nombre) LIKE 'TEMPORADA BAJA%' THEN 2
+               ELSE 1
+           END AS prioridad
+    FROM NochesReserva nr
+    LEFT JOIN temporada temp
+        ON nr.fecha_noche BETWEEN TRUNC(temp.fecha_inicio) AND TRUNC(temp.fecha_fin)
+),
+TemporadasPriorizadas AS (
+    SELECT ct.*,
+           MIN(prioridad) OVER (PARTITION BY id_reserva_habitacion, fecha_noche) AS prioridad_minima
+    FROM CandidatasTemporada ct
+),
+NochesClasificadas AS (
+    SELECT id_municipio,
+           municipio,
+           id_tipo_alojamiento,
+           tipo_alojamiento,
+           id_reserva_habitacion,
+           fecha_noche,
+           ingreso_noche,
+           CASE
+               WHEN COUNT(id_temporada) = 0 THEN NULL
+               WHEN SUM(CASE WHEN prioridad = prioridad_minima THEN 1 ELSE 0 END) > 1 THEN NULL
+               ELSE MIN(CASE WHEN prioridad = prioridad_minima THEN id_temporada END)
+           END AS id_temporada,
+           CASE
+               WHEN COUNT(id_temporada) = 0 THEN '*** SIN TEMPORADA ***'
+               WHEN SUM(CASE WHEN prioridad = prioridad_minima THEN 1 ELSE 0 END) > 1 THEN '*** TEMPORADA AMBIGUA ***'
+               ELSE MAX(CASE WHEN prioridad = prioridad_minima THEN temporada END)
+           END AS temporada
+    FROM TemporadasPriorizadas
+    GROUP BY id_municipio,
+             municipio,
+             id_tipo_alojamiento,
+             tipo_alojamiento,
+             id_reserva_habitacion,
+             fecha_noche,
+             ingreso_noche
+)
 SELECT 
-    CASE WHEN GROUPING(m.nombre) = 1 THEN '--- TOTAL GENERAL ---' ELSE m.nombre END AS municipio,
-    CASE WHEN GROUPING(ta.nombre) = 1 THEN '--- SUBTOTAL MUNICIPIO ---' ELSE ta.nombre END AS tipo_alojamiento,
-    CASE WHEN GROUPING(temp.nombre) = 1 THEN '--- SUBTOTAL TIPO ---' ELSE temp.nombre END AS temporada,
-    SUM(p.monto) AS ingresos_totales
-FROM municipio m
-JOIN alojamiento a ON m.id_municipio = a.id_municipio
-JOIN tipo_alojamiento ta ON a.id_tipo_alojamiento = ta.id_tipo_alojamiento
-JOIN habitacion h ON a.id_alojamiento = h.id_alojamiento
-JOIN tarifa tar ON h.id_habitacion = tar.id_habitacion
-JOIN temporada temp ON tar.id_temporada = temp.id_temporada
-JOIN reserva_habitacion rh ON h.id_habitacion = rh.id_habitacion
-JOIN pago p ON rh.id_reserva = p.id_reserva
-GROUP BY ROLLUP (m.nombre, ta.nombre, temp.nombre);
+    CASE WHEN GROUPING(id_municipio) = 1 THEN '--- TOTAL GENERAL ---' ELSE municipio END AS municipio,
+    CASE
+        WHEN GROUPING(id_municipio) = 1 THEN NULL
+        WHEN GROUPING(id_tipo_alojamiento) = 1 THEN '--- SUBTOTAL MUNICIPIO ---'
+        ELSE tipo_alojamiento
+    END AS tipo_alojamiento,
+    CASE
+        WHEN GROUPING(id_municipio) = 1 THEN NULL
+        WHEN GROUPING(id_tipo_alojamiento) = 1 THEN NULL
+        WHEN GROUPING(id_temporada) = 1 THEN '--- SUBTOTAL TIPO ---'
+        ELSE temporada
+    END AS temporada,
+    ROUND(SUM(ingreso_noche), 2) AS ingresos_totales
+FROM NochesClasificadas
+GROUP BY ROLLUP (
+    (id_municipio, municipio),
+    (id_tipo_alojamiento, tipo_alojamiento),
+    (id_temporada, temporada)
+)
+ORDER BY GROUPING(id_municipio),
+         municipio,
+         GROUPING(id_tipo_alojamiento),
+         tipo_alojamiento,
+         GROUPING(id_temporada),
+         temporada;
 
 
 -- 3. LOS 3 ALOJAMIENTOS DE MAYOR INGRESO DENTRO DE CADA MUNICIPIO
-WITH RankingIngresos AS (
-    SELECT m.nombre AS municipio,
+WITH IngresosAlojamiento AS (
+    SELECT m.id_municipio,
+           m.nombre AS municipio,
+           a.id_alojamiento,
            a.nombre AS alojamiento,
-           SUM(p.monto) AS ingresos_totales,
-           RANK() OVER (PARTITION BY m.nombre ORDER BY SUM(p.monto) DESC) AS ranking
+           SUM(rh.subtotal_calculado) AS ingresos_totales
     FROM municipio m
     JOIN alojamiento a ON m.id_municipio = a.id_municipio
     JOIN habitacion h ON a.id_alojamiento = h.id_alojamiento
     JOIN reserva_habitacion rh ON h.id_habitacion = rh.id_habitacion
-    JOIN pago p ON rh.id_reserva = p.id_reserva
-    GROUP BY m.nombre, a.nombre
+    GROUP BY m.id_municipio,
+             m.nombre,
+             a.id_alojamiento,
+             a.nombre
+),
+RankingIngresos AS (
+    SELECT municipio,
+           alojamiento,
+           ingresos_totales,
+           RANK() OVER (PARTITION BY id_municipio ORDER BY ingresos_totales DESC) AS ranking
+    FROM IngresosAlojamiento
 )
-SELECT municipio, alojamiento, ingresos_totales, ranking
+SELECT municipio, alojamiento, ROUND(ingresos_totales, 2) AS ingresos_totales, ranking
 FROM RankingIngresos
 WHERE ranking <= 3
-ORDER BY municipio, ranking;
+ORDER BY municipio, ranking, alojamiento;
 
 
 -- 4. VARIACIÓN DE INGRESOS MES CONTRA MES (LAG)
@@ -98,7 +188,15 @@ ORDER BY rh.fecha_checkin;
 -- 6. VISTA MATERIALIZADA DE OCUPACIÓN MENSUAL CON POLÍTICA DE REFRESCO
 
 -- Paso 1: Si ya existía de pruebas anteriores, la borramos para evitar errores.
-DROP MATERIALIZED VIEW mv_ocupacion_mensual;
+BEGIN
+    EXECUTE IMMEDIATE 'DROP MATERIALIZED VIEW mv_ocupacion_mensual';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -12003 THEN
+            RAISE;
+        END IF;
+END;
+/
 
 -- Paso 2: Creación de la Vista Materializada
 CREATE MATERIALIZED VIEW mv_ocupacion_mensual
