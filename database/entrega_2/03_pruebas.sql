@@ -7,11 +7,56 @@ SET SERVEROUTPUT ON;
 
 -- PRUEBA 1: Estadia dentro de una sola temporada baja.
 DECLARE
-    v_resultado NUMBER;
+    v_resultado          NUMBER;
+    v_esperado           NUMBER;
+    v_noches             NUMBER;
+    v_temporadas_invalidas NUMBER;
+    v_tarifas_invalidas    NUMBER;
 BEGIN
+    WITH noches AS (
+        SELECT DATE '2026-06-10' + LEVEL - 1 AS fecha_noche
+          FROM dual
+        CONNECT BY LEVEL <= DATE '2026-06-12' - DATE '2026-06-10'
+    ),
+    candidatas AS (
+        SELECT n.fecha_noche, t.id_temporada,
+               CASE WHEN UPPER(t.nombre) LIKE 'TEMPORADA BAJA%' THEN 2 ELSE 1 END AS prioridad
+          FROM noches n
+          JOIN temporada t
+            ON n.fecha_noche BETWEEN TRUNC(t.fecha_inicio) AND TRUNC(t.fecha_fin)
+    ),
+    priorizadas AS (
+        SELECT c.*, MIN(prioridad) OVER (PARTITION BY fecha_noche) AS prioridad_minima
+          FROM candidatas c
+    ),
+    detalle AS (
+        SELECT n.fecha_noche,
+               COUNT(DISTINCT p.id_temporada) AS cantidad_temporadas,
+               COUNT(ta.id_tarifa) AS cantidad_tarifas,
+               MAX(ta.valor_noche) AS valor_noche
+          FROM noches n
+          LEFT JOIN priorizadas p
+            ON p.fecha_noche = n.fecha_noche
+           AND p.prioridad = p.prioridad_minima
+          LEFT JOIN tarifa ta
+            ON ta.id_habitacion = 1
+           AND ta.id_temporada = p.id_temporada
+         GROUP BY n.fecha_noche
+    )
+    SELECT COUNT(*),
+           NVL(SUM(CASE WHEN cantidad_temporadas != 1 THEN 1 ELSE 0 END), 0),
+           NVL(SUM(CASE WHEN cantidad_tarifas != 1 THEN 1 ELSE 0 END), 0),
+           SUM(valor_noche)
+      INTO v_noches, v_temporadas_invalidas, v_tarifas_invalidas, v_esperado
+      FROM detalle;
+
+    IF v_noches != 2 OR v_temporadas_invalidas != 0 OR v_tarifas_invalidas != 0 THEN
+        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 1 fallo: referencia SQL no es univoca.');
+    END IF;
+
     v_resultado := fn_valor_estadia(1, DATE '2026-06-10', DATE '2026-06-12');
-    IF v_resultado != 415507.90 THEN
-        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 1 fallo. Resultado: ' || v_resultado);
+    IF v_resultado IS NULL OR v_esperado IS NULL OR v_resultado - v_esperado != 0 THEN
+        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 1 fallo. SQL=' || v_esperado || ', funcion=' || v_resultado);
     END IF;
     DBMS_OUTPUT.PUT_LINE('PRUEBA 1 OK: ' || TO_CHAR(v_resultado, 'FM9999999990D00'));
 END;
@@ -19,11 +64,56 @@ END;
 
 -- PRUEBA 2: Estadia dentro de una sola temporada especial.
 DECLARE
-    v_resultado NUMBER;
+    v_resultado          NUMBER;
+    v_esperado           NUMBER;
+    v_noches             NUMBER;
+    v_temporadas_invalidas NUMBER;
+    v_tarifas_invalidas    NUMBER;
 BEGIN
+    WITH noches AS (
+        SELECT DATE '2024-03-25' + LEVEL - 1 AS fecha_noche
+          FROM dual
+        CONNECT BY LEVEL <= DATE '2024-03-27' - DATE '2024-03-25'
+    ),
+    candidatas AS (
+        SELECT n.fecha_noche, t.id_temporada,
+               CASE WHEN UPPER(t.nombre) LIKE 'TEMPORADA BAJA%' THEN 2 ELSE 1 END AS prioridad
+          FROM noches n
+          JOIN temporada t
+            ON n.fecha_noche BETWEEN TRUNC(t.fecha_inicio) AND TRUNC(t.fecha_fin)
+    ),
+    priorizadas AS (
+        SELECT c.*, MIN(prioridad) OVER (PARTITION BY fecha_noche) AS prioridad_minima
+          FROM candidatas c
+    ),
+    detalle AS (
+        SELECT n.fecha_noche,
+               COUNT(DISTINCT p.id_temporada) AS cantidad_temporadas,
+               COUNT(ta.id_tarifa) AS cantidad_tarifas,
+               MAX(ta.valor_noche) AS valor_noche
+          FROM noches n
+          LEFT JOIN priorizadas p
+            ON p.fecha_noche = n.fecha_noche
+           AND p.prioridad = p.prioridad_minima
+          LEFT JOIN tarifa ta
+            ON ta.id_habitacion = 1
+           AND ta.id_temporada = p.id_temporada
+         GROUP BY n.fecha_noche
+    )
+    SELECT COUNT(*),
+           NVL(SUM(CASE WHEN cantidad_temporadas != 1 THEN 1 ELSE 0 END), 0),
+           NVL(SUM(CASE WHEN cantidad_tarifas != 1 THEN 1 ELSE 0 END), 0),
+           SUM(valor_noche)
+      INTO v_noches, v_temporadas_invalidas, v_tarifas_invalidas, v_esperado
+      FROM detalle;
+
+    IF v_noches != 2 OR v_temporadas_invalidas != 0 OR v_tarifas_invalidas != 0 THEN
+        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 2 fallo: referencia SQL no es univoca.');
+    END IF;
+
     v_resultado := fn_valor_estadia(1, DATE '2024-03-25', DATE '2024-03-27');
-    IF v_resultado != 244250.24 THEN
-        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 2 fallo. Resultado: ' || v_resultado);
+    IF v_resultado IS NULL OR v_esperado IS NULL OR v_resultado - v_esperado != 0 THEN
+        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 2 fallo. SQL=' || v_esperado || ', funcion=' || v_resultado);
     END IF;
     DBMS_OUTPUT.PUT_LINE('PRUEBA 2 OK: ' || TO_CHAR(v_resultado, 'FM9999999990D00'));
 END;
@@ -31,11 +121,56 @@ END;
 
 -- PRUEBA 3: Estadia que cruza temporada especial y temporada baja.
 DECLARE
-    v_resultado NUMBER;
+    v_resultado          NUMBER;
+    v_esperado           NUMBER;
+    v_noches             NUMBER;
+    v_temporadas_invalidas NUMBER;
+    v_tarifas_invalidas    NUMBER;
 BEGIN
+    WITH noches AS (
+        SELECT DATE '2024-03-28' + LEVEL - 1 AS fecha_noche
+          FROM dual
+        CONNECT BY LEVEL <= DATE '2024-04-03' - DATE '2024-03-28'
+    ),
+    candidatas AS (
+        SELECT n.fecha_noche, t.id_temporada,
+               CASE WHEN UPPER(t.nombre) LIKE 'TEMPORADA BAJA%' THEN 2 ELSE 1 END AS prioridad
+          FROM noches n
+          JOIN temporada t
+            ON n.fecha_noche BETWEEN TRUNC(t.fecha_inicio) AND TRUNC(t.fecha_fin)
+    ),
+    priorizadas AS (
+        SELECT c.*, MIN(prioridad) OVER (PARTITION BY fecha_noche) AS prioridad_minima
+          FROM candidatas c
+    ),
+    detalle AS (
+        SELECT n.fecha_noche,
+               COUNT(DISTINCT p.id_temporada) AS cantidad_temporadas,
+               COUNT(ta.id_tarifa) AS cantidad_tarifas,
+               MAX(ta.valor_noche) AS valor_noche
+          FROM noches n
+          LEFT JOIN priorizadas p
+            ON p.fecha_noche = n.fecha_noche
+           AND p.prioridad = p.prioridad_minima
+          LEFT JOIN tarifa ta
+            ON ta.id_habitacion = 1
+           AND ta.id_temporada = p.id_temporada
+         GROUP BY n.fecha_noche
+    )
+    SELECT COUNT(*),
+           NVL(SUM(CASE WHEN cantidad_temporadas != 1 THEN 1 ELSE 0 END), 0),
+           NVL(SUM(CASE WHEN cantidad_tarifas != 1 THEN 1 ELSE 0 END), 0),
+           SUM(valor_noche)
+      INTO v_noches, v_temporadas_invalidas, v_tarifas_invalidas, v_esperado
+      FROM detalle;
+
+    IF v_noches != 6 OR v_temporadas_invalidas != 0 OR v_tarifas_invalidas != 0 THEN
+        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 3 fallo: referencia SQL no es univoca.');
+    END IF;
+
     v_resultado := fn_valor_estadia(1, DATE '2024-03-28', DATE '2024-04-03');
-    IF v_resultado != 937948.66 THEN
-        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 3 fallo. Resultado: ' || v_resultado);
+    IF v_resultado IS NULL OR v_esperado IS NULL OR v_resultado - v_esperado != 0 THEN
+        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 3 fallo. SQL=' || v_esperado || ', funcion=' || v_resultado);
     END IF;
     DBMS_OUTPUT.PUT_LINE('PRUEBA 3 OK: ' || TO_CHAR(v_resultado, 'FM9999999990D00'));
 END;
@@ -43,11 +178,56 @@ END;
 
 -- PRUEBA 4: Estadia de una sola noche; el checkout no se cobra.
 DECLARE
-    v_resultado NUMBER;
+    v_resultado          NUMBER;
+    v_esperado           NUMBER;
+    v_noches             NUMBER;
+    v_temporadas_invalidas NUMBER;
+    v_tarifas_invalidas    NUMBER;
 BEGIN
+    WITH noches AS (
+        SELECT DATE '2026-06-10' + LEVEL - 1 AS fecha_noche
+          FROM dual
+        CONNECT BY LEVEL <= DATE '2026-06-11' - DATE '2026-06-10'
+    ),
+    candidatas AS (
+        SELECT n.fecha_noche, t.id_temporada,
+               CASE WHEN UPPER(t.nombre) LIKE 'TEMPORADA BAJA%' THEN 2 ELSE 1 END AS prioridad
+          FROM noches n
+          JOIN temporada t
+            ON n.fecha_noche BETWEEN TRUNC(t.fecha_inicio) AND TRUNC(t.fecha_fin)
+    ),
+    priorizadas AS (
+        SELECT c.*, MIN(prioridad) OVER (PARTITION BY fecha_noche) AS prioridad_minima
+          FROM candidatas c
+    ),
+    detalle AS (
+        SELECT n.fecha_noche,
+               COUNT(DISTINCT p.id_temporada) AS cantidad_temporadas,
+               COUNT(ta.id_tarifa) AS cantidad_tarifas,
+               MAX(ta.valor_noche) AS valor_noche
+          FROM noches n
+          LEFT JOIN priorizadas p
+            ON p.fecha_noche = n.fecha_noche
+           AND p.prioridad = p.prioridad_minima
+          LEFT JOIN tarifa ta
+            ON ta.id_habitacion = 1
+           AND ta.id_temporada = p.id_temporada
+         GROUP BY n.fecha_noche
+    )
+    SELECT COUNT(*),
+           NVL(SUM(CASE WHEN cantidad_temporadas != 1 THEN 1 ELSE 0 END), 0),
+           NVL(SUM(CASE WHEN cantidad_tarifas != 1 THEN 1 ELSE 0 END), 0),
+           SUM(valor_noche)
+      INTO v_noches, v_temporadas_invalidas, v_tarifas_invalidas, v_esperado
+      FROM detalle;
+
+    IF v_noches != 1 OR v_temporadas_invalidas != 0 OR v_tarifas_invalidas != 0 THEN
+        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 4 fallo: referencia SQL no es univoca.');
+    END IF;
+
     v_resultado := fn_valor_estadia(1, DATE '2026-06-10', DATE '2026-06-11');
-    IF v_resultado != 207753.95 THEN
-        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 4 fallo. Resultado: ' || v_resultado);
+    IF v_resultado IS NULL OR v_esperado IS NULL OR v_resultado - v_esperado != 0 THEN
+        RAISE_APPLICATION_ERROR(-20990, 'PRUEBA 4 fallo. SQL=' || v_esperado || ', funcion=' || v_resultado);
     END IF;
     DBMS_OUTPUT.PUT_LINE('PRUEBA 4 OK: ' || TO_CHAR(v_resultado, 'FM9999999990D00'));
 END;
@@ -297,7 +477,7 @@ JOIN tarifa ta
 WHERE p.prioridad = p.prioridad_minima
 ORDER BY p.fecha_noche;
 
--- COMPARACION INDEPENDIENTE PRUEBA 3: Ambos valores deben ser 937948.66.
+-- COMPARACION INDEPENDIENTE PRUEBA 3: ambos valores deben coincidir.
 WITH Noches AS (
     SELECT DATE '2024-03-28' + LEVEL - 1 AS fecha_noche
     FROM dual
