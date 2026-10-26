@@ -1,0 +1,319 @@
+"""Oracle queries and application operations used by the Streamlit frontend."""
+
+from __future__ import annotations
+
+from datetime import date, datetime, time
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+import oracledb
+import pandas as pd
+import streamlit as st
+
+from db import DatabaseError, call_function, call_procedure, fetch_all, fetch_one, test_connection
+
+
+def formato_moneda_colombiana(value: Any) -> str:
+    """Format a numeric value for display without changing its stored type."""
+    try:
+        amount = Decimal(str(value or 0)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError, TypeError):
+        amount = Decimal("0.00")
+    formatted = f"{amount:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    return f"${formatted}"
+
+
+def _oracle_date(value: date) -> datetime:
+    return datetime.combine(value, time.min)
+
+
+def mensaje_error_reserva(error: DatabaseError) -> str:
+    messages = {
+        20201: "La habitación no está disponible para las fechas seleccionadas.",
+        20202: "El checkout debe ser posterior al check-in.",
+        20203: "El número de huéspedes supera la capacidad permitida.",
+        20204: "Faltan datos válidos o alguna entidad ya no existe.",
+        20205: "La reserva se cruza con otra reserva existente.",
+        20106: "No existe una temporada configurada para alguna noche.",
+        20107: "Existe una configuración ambigua de temporadas.",
+        20108: "No existe tarifa para alguna noche de la estadía.",
+        20109: "Existen tarifas duplicadas para la habitación y temporada.",
+    }
+    return messages.get(error.code, error.user_message)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def obtener_metricas() -> dict[str, Any]:
+    row = fetch_one(
+        """
+        WITH ingresos_habitaciones AS (
+            SELECT NVL(SUM(rh.subtotal_calculado), 0) AS total
+              FROM reserva_habitacion rh
+              JOIN reserva r ON r.id_reserva = rh.id_reserva
+             WHERE r.estado <> 'CANCELADA'
+        ),
+        ingresos_servicios AS (
+            SELECT NVL(SUM(rs.subtotal), 0) AS total
+              FROM reserva_servicio rs
+              JOIN reserva r ON r.id_reserva = rs.id_reserva
+             WHERE r.estado <> 'CANCELADA'
+        )
+        SELECT (SELECT COUNT(*) FROM municipio) AS municipios,
+               (SELECT COUNT(*) FROM alojamiento) AS alojamientos,
+               (SELECT COUNT(*) FROM habitacion) AS habitaciones,
+               (SELECT COUNT(*) FROM cliente) AS clientes,
+               (SELECT COUNT(*) FROM reserva) AS reservas,
+               ih.total AS ingresos_habitaciones,
+               ise.total AS ingresos_servicios,
+               ih.total + ise.total AS ingresos_historicos
+          FROM ingresos_habitaciones ih
+          CROSS JOIN ingresos_servicios ise
+        """
+    )
+    return row or {}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def obtener_reservas_por_estado() -> pd.DataFrame:
+    rows = fetch_all(
+        """
+        SELECT estado, COUNT(*) AS cantidad
+          FROM reserva
+         GROUP BY estado
+         ORDER BY cantidad DESC, estado
+        """
+    )
+    return pd.DataFrame(rows, columns=["estado", "cantidad"])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def obtener_reservas_por_municipio(limite: int = 12) -> pd.DataFrame:
+    rows = fetch_all(
+        """
+        SELECT municipio, cantidad
+          FROM (
+              SELECT m.nombre AS municipio,
+                     COUNT(DISTINCT r.id_reserva) AS cantidad
+                FROM reserva r
+                JOIN reserva_habitacion rh ON rh.id_reserva = r.id_reserva
+                JOIN habitacion h ON h.id_habitacion = rh.id_habitacion
+                JOIN alojamiento a ON a.id_alojamiento = h.id_alojamiento
+                JOIN municipio m ON m.id_municipio = a.id_municipio
+               GROUP BY m.id_municipio, m.nombre
+               ORDER BY cantidad DESC, m.nombre
+          )
+         WHERE ROWNUM <= :limite
+        """,
+        {"limite": limite},
+    )
+    return pd.DataFrame(rows, columns=["municipio", "cantidad"])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def obtener_evolucion_mensual() -> pd.DataFrame:
+    rows = fetch_all(
+        """
+        SELECT TRUNC(fecha_creacion, 'MM') AS periodo,
+               COUNT(*) AS cantidad
+          FROM reserva
+         GROUP BY TRUNC(fecha_creacion, 'MM')
+         ORDER BY periodo
+        """
+    )
+    return pd.DataFrame(rows, columns=["periodo", "cantidad"])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def obtener_top_alojamientos(limite: int = 10) -> pd.DataFrame:
+    rows = fetch_all(
+        """
+        WITH habitaciones AS (
+            SELECT h.id_alojamiento,
+                   SUM(rh.subtotal_calculado) AS ingreso_habitaciones
+              FROM reserva_habitacion rh
+              JOIN reserva r ON r.id_reserva = rh.id_reserva
+              JOIN habitacion h ON h.id_habitacion = rh.id_habitacion
+             WHERE r.estado <> 'CANCELADA'
+             GROUP BY h.id_alojamiento
+        ),
+        servicios AS (
+            SELECT s.id_alojamiento,
+                   SUM(rs.subtotal) AS ingreso_servicios
+              FROM reserva_servicio rs
+              JOIN reserva r ON r.id_reserva = rs.id_reserva
+              JOIN servicio s ON s.id_servicio = rs.id_servicio
+             WHERE r.estado <> 'CANCELADA'
+             GROUP BY s.id_alojamiento
+        )
+        SELECT alojamiento, municipio, ingreso_habitaciones,
+               ingreso_servicios, total
+          FROM (
+              SELECT a.nombre AS alojamiento,
+                     m.nombre AS municipio,
+                     NVL(h.ingreso_habitaciones, 0) AS ingreso_habitaciones,
+                     NVL(s.ingreso_servicios, 0) AS ingreso_servicios,
+                     NVL(h.ingreso_habitaciones, 0)
+                       + NVL(s.ingreso_servicios, 0) AS total
+                FROM alojamiento a
+                JOIN municipio m ON m.id_municipio = a.id_municipio
+                LEFT JOIN habitaciones h ON h.id_alojamiento = a.id_alojamiento
+                LEFT JOIN servicios s ON s.id_alojamiento = a.id_alojamiento
+               WHERE h.id_alojamiento IS NOT NULL OR s.id_alojamiento IS NOT NULL
+               ORDER BY total DESC, a.nombre
+          )
+         WHERE ROWNUM <= :limite
+        """,
+        {"limite": limite},
+    )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "alojamiento",
+            "municipio",
+            "ingreso_habitaciones",
+            "ingreso_servicios",
+            "total",
+        ],
+    )
+
+
+def obtener_clientes() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT id_cliente,
+               nombre_completo,
+               tipo_identificacion,
+               identificacion
+          FROM cliente
+         ORDER BY nombre_completo, id_cliente
+        """
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def obtener_municipios() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT id_municipio, nombre
+          FROM municipio
+         ORDER BY nombre
+        """
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def obtener_alojamientos_por_municipio(id_municipio: int) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT a.id_alojamiento,
+               a.nombre,
+               ta.nombre AS tipo
+          FROM alojamiento a
+          JOIN tipo_alojamiento ta
+            ON ta.id_tipo_alojamiento = a.id_tipo_alojamiento
+         WHERE a.id_municipio = :id_municipio
+         ORDER BY a.nombre, a.id_alojamiento
+        """,
+        {"id_municipio": id_municipio},
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def obtener_habitaciones_por_alojamiento(id_alojamiento: int) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT id_habitacion, numero, capacidad
+          FROM habitacion
+         WHERE id_alojamiento = :id_alojamiento
+         ORDER BY numero, id_habitacion
+        """,
+        {"id_alojamiento": id_alojamiento},
+    )
+
+
+def calcular_valor_estadia(
+    id_habitacion: int, fecha_in: date, fecha_out: date
+) -> Decimal:
+    value = call_function(
+        "PKG_TURISMO.VALOR_ESTADIA",
+        oracledb.NUMBER,
+        [id_habitacion, _oracle_date(fecha_in), _oracle_date(fecha_out)],
+    )
+    return Decimal(str(value))
+
+
+def crear_reserva(
+    id_cliente: int,
+    id_habitacion: int,
+    fecha_in: date,
+    fecha_out: date,
+    huespedes: int,
+) -> int:
+    output_values = call_procedure(
+        "PKG_TURISMO.SP_CREAR_RESERVA",
+        [
+            id_cliente,
+            id_habitacion,
+            _oracle_date(fecha_in),
+            _oracle_date(fecha_out),
+            huespedes,
+        ],
+        [oracledb.NUMBER],
+    )
+    limpiar_cache_dashboard()
+    return int(output_values[0])
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def obtener_estado_sistema() -> pd.DataFrame:
+    rows = fetch_all(
+        """
+        WITH esperados (objeto, tipo) AS (
+            SELECT 'FN_VALOR_ESTADIA', 'FUNCTION' FROM dual UNION ALL
+            SELECT 'PKG_TURISMO', 'PACKAGE' FROM dual UNION ALL
+            SELECT 'PKG_TURISMO', 'PACKAGE BODY' FROM dual UNION ALL
+            SELECT 'TRG_AUDITORIA_TARIFA', 'TRIGGER' FROM dual UNION ALL
+            SELECT 'TRG_SOLAPAMIENTO_RESERVA_HAB', 'TRIGGER' FROM dual
+        )
+        SELECT e.objeto,
+               e.tipo,
+               NVL(o.status, 'NO EXISTE') AS estado
+          FROM esperados e
+          LEFT JOIN user_objects o
+            ON o.object_name = e.objeto
+           AND o.object_type = e.tipo
+         ORDER BY e.objeto, e.tipo
+        """
+    )
+    return pd.DataFrame(rows, columns=["objeto", "tipo", "estado"])
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def obtener_info_sesion() -> dict[str, Any]:
+    row = fetch_one(
+        """
+        SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') AS usuario,
+               SYSTIMESTAMP AS hora_oracle,
+               (SELECT COUNT(*) FROM user_errors) AS errores_compilacion,
+               (SELECT COUNT(*) FROM user_tables
+                 WHERE table_name = 'AUDITORIA_TARIFA') AS existe_auditoria,
+               (SELECT COUNT(*) FROM user_tables
+                 WHERE table_name = 'LIQUIDACION_MENSUAL') AS existe_liquidacion
+          FROM dual
+        """
+    )
+    return row or {}
+
+
+def probar_conexion() -> dict[str, Any]:
+    return test_connection()
+
+
+def limpiar_cache_dashboard() -> None:
+    obtener_metricas.clear()
+    obtener_reservas_por_estado.clear()
+    obtener_reservas_por_municipio.clear()
+    obtener_evolucion_mensual.clear()
+    obtener_top_alojamientos.clear()
+    obtener_estado_sistema.clear()
+    obtener_info_sesion.clear()
