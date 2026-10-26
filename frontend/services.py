@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -201,6 +201,36 @@ def obtener_municipios() -> list[dict[str, Any]]:
     )
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def obtener_estados_reserva() -> list[str]:
+    rows = fetch_all(
+        """
+        SELECT DISTINCT estado
+          FROM reserva
+         ORDER BY estado
+        """
+    )
+    return [row["estado"] for row in rows]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def obtener_alojamientos() -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT a.id_alojamiento,
+               a.id_municipio,
+               a.nombre,
+               m.nombre AS municipio,
+               ta.nombre AS tipo
+          FROM alojamiento a
+          JOIN municipio m ON m.id_municipio = a.id_municipio
+          JOIN tipo_alojamiento ta
+            ON ta.id_tipo_alojamiento = a.id_tipo_alojamiento
+         ORDER BY m.nombre, a.nombre, a.id_alojamiento
+        """
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def obtener_alojamientos_por_municipio(id_municipio: int) -> list[dict[str, Any]]:
     return fetch_all(
@@ -215,6 +245,114 @@ def obtener_alojamientos_por_municipio(id_municipio: int) -> list[dict[str, Any]
          ORDER BY a.nombre, a.id_alojamiento
         """,
         {"id_municipio": id_municipio},
+    )
+
+
+def buscar_reservas(
+    *,
+    estado: str | None = None,
+    id_municipio: int | None = None,
+    id_alojamiento: int | None = None,
+    cliente_texto: str | None = None,
+    fecha_desde: date | None = None,
+    fecha_hasta: date | None = None,
+    limite: int = 100,
+) -> pd.DataFrame:
+    """Return filtered room assignments; all filtering and limiting happens in Oracle."""
+    conditions: list[str] = []
+    binds: dict[str, Any] = {}
+
+    if estado:
+        conditions.append("r.estado = :estado")
+        binds["estado"] = estado
+    if id_municipio is not None:
+        conditions.append("m.id_municipio = :id_municipio")
+        binds["id_municipio"] = id_municipio
+    if id_alojamiento is not None:
+        conditions.append("a.id_alojamiento = :id_alojamiento")
+        binds["id_alojamiento"] = id_alojamiento
+
+    normalized_client = (cliente_texto or "").strip().upper()
+    if normalized_client:
+        conditions.append(
+            "(UPPER(c.nombre_completo) LIKE :cliente "
+            "OR UPPER(c.identificacion) LIKE :cliente)"
+        )
+        binds["cliente"] = f"%{normalized_client}%"
+
+    if fecha_desde is not None:
+        conditions.append("rh.fecha_checkin >= :fecha_desde")
+        binds["fecha_desde"] = _oracle_date(fecha_desde)
+    if fecha_hasta is not None:
+        conditions.append("rh.fecha_checkin < :fecha_hasta_exclusiva")
+        binds["fecha_hasta_exclusiva"] = _oracle_date(fecha_hasta + timedelta(days=1))
+
+    safe_limit = max(1, min(int(limite), 500))
+    binds["limite"] = safe_limit
+    where_clause = "\n           AND ".join(conditions)
+    if where_clause:
+        where_clause = "AND " + where_clause
+
+    rows = fetch_all(
+        f"""
+        SELECT id_reserva,
+               fecha_reserva,
+               cliente,
+               identificacion,
+               municipio,
+               alojamiento,
+               habitacion,
+               fecha_checkin,
+               fecha_checkout,
+               noches,
+               estado,
+               subtotal
+          FROM (
+              SELECT r.id_reserva,
+                     r.fecha_creacion AS fecha_reserva,
+                     c.nombre_completo AS cliente,
+                     c.identificacion,
+                     m.nombre AS municipio,
+                     a.nombre AS alojamiento,
+                     h.numero AS habitacion,
+                     rh.fecha_checkin,
+                     rh.fecha_checkout,
+                     TRUNC(rh.fecha_checkout) - TRUNC(rh.fecha_checkin) AS noches,
+                     r.estado,
+                     rh.subtotal_calculado AS subtotal,
+                     rh.id_reserva_habitacion
+                FROM reserva r
+                JOIN cliente c ON c.id_cliente = r.id_cliente
+                JOIN reserva_habitacion rh ON rh.id_reserva = r.id_reserva
+                JOIN habitacion h ON h.id_habitacion = rh.id_habitacion
+                JOIN alojamiento a ON a.id_alojamiento = h.id_alojamiento
+                JOIN municipio m ON m.id_municipio = a.id_municipio
+               WHERE 1 = 1
+                 {where_clause}
+               ORDER BY rh.fecha_checkin DESC,
+                        r.id_reserva DESC,
+                        rh.id_reserva_habitacion DESC
+          )
+         WHERE ROWNUM <= :limite
+        """,
+        binds,
+    )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "id_reserva",
+            "fecha_reserva",
+            "cliente",
+            "identificacion",
+            "municipio",
+            "alojamiento",
+            "habitacion",
+            "fecha_checkin",
+            "fecha_checkout",
+            "noches",
+            "estado",
+            "subtotal",
+        ],
     )
 
 
