@@ -402,6 +402,252 @@ def crear_reserva(
     return int(output_values[0])
 
 
+def mensaje_error_liquidacion(error: DatabaseError) -> str:
+    if error.code == 20206:
+        return "El año o mes seleccionado no es válido."
+    return error.user_message
+
+
+def generar_liquidacion(anio: int, mes: int) -> int:
+    output_values = call_procedure(
+        "PKG_TURISMO.SP_LIQUIDAR_MES",
+        [int(anio), int(mes)],
+        [oracledb.NUMBER],
+    )
+    return int(output_values[0])
+
+
+def obtener_liquidacion_periodo(anio: int, mes: int) -> pd.DataFrame:
+    periodo = datetime(int(anio), int(mes), 1)
+    rows = fetch_all(
+        """
+        SELECT lm.id_alojamiento,
+               m.nombre AS municipio,
+               a.nombre AS alojamiento,
+               lm.periodo,
+               lm.noches,
+               lm.ingreso_habitaciones,
+               lm.ingreso_servicios,
+               lm.total,
+               lm.fecha_generacion
+          FROM liquidacion_mensual lm
+          JOIN alojamiento a ON a.id_alojamiento = lm.id_alojamiento
+          JOIN municipio m ON m.id_municipio = a.id_municipio
+         WHERE lm.periodo = :periodo
+         ORDER BY lm.total DESC, a.nombre
+        """,
+        {"periodo": periodo},
+    )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "id_alojamiento",
+            "municipio",
+            "alojamiento",
+            "periodo",
+            "noches",
+            "ingreso_habitaciones",
+            "ingreso_servicios",
+            "total",
+            "fecha_generacion",
+        ],
+    )
+
+
+def obtener_resumen_liquidacion(anio: int, mes: int) -> dict[str, Any]:
+    periodo = datetime(int(anio), int(mes), 1)
+    row = fetch_one(
+        """
+        SELECT COUNT(*) AS alojamientos,
+               NVL(SUM(noches), 0) AS noches,
+               NVL(SUM(ingreso_habitaciones), 0) AS ingreso_habitaciones,
+               NVL(SUM(ingreso_servicios), 0) AS ingreso_servicios,
+               NVL(SUM(total), 0) AS total,
+               MAX(fecha_generacion) AS ultima_generacion
+          FROM liquidacion_mensual
+         WHERE periodo = :periodo
+        """,
+        {"periodo": periodo},
+    )
+    return row or {
+        "alojamientos": 0,
+        "noches": 0,
+        "ingreso_habitaciones": 0,
+        "ingreso_servicios": 0,
+        "total": 0,
+        "ultima_generacion": None,
+    }
+
+
+def obtener_operaciones_auditoria() -> list[str]:
+    rows = fetch_all(
+        """
+        SELECT DISTINCT operacion
+          FROM auditoria_tarifa
+         ORDER BY operacion
+        """
+    )
+    return [row["operacion"] for row in rows]
+
+
+def obtener_usuarios_auditoria() -> list[str]:
+    rows = fetch_all(
+        """
+        SELECT DISTINCT usuario_bd
+          FROM auditoria_tarifa
+         ORDER BY usuario_bd
+        """
+    )
+    return [row["usuario_bd"] for row in rows]
+
+
+def buscar_auditorias(
+    *,
+    operacion: str | None = None,
+    usuario: str | None = None,
+    fecha_desde: date | None = None,
+    fecha_hasta: date | None = None,
+    id_tarifa: int | None = None,
+    id_habitacion: int | None = None,
+    limite: int = 100,
+) -> pd.DataFrame:
+    conditions: list[str] = []
+    binds: dict[str, Any] = {}
+
+    if operacion:
+        conditions.append("au.operacion = :operacion")
+        binds["operacion"] = operacion
+    if usuario:
+        conditions.append("au.usuario_bd = :usuario")
+        binds["usuario"] = usuario
+    if fecha_desde is not None:
+        conditions.append("au.fecha_cambio >= :fecha_desde")
+        binds["fecha_desde"] = _oracle_date(fecha_desde)
+    if fecha_hasta is not None:
+        conditions.append("au.fecha_cambio < :fecha_hasta_exclusiva")
+        binds["fecha_hasta_exclusiva"] = _oracle_date(fecha_hasta + timedelta(days=1))
+    if id_tarifa is not None:
+        conditions.append("au.id_tarifa = :id_tarifa")
+        binds["id_tarifa"] = int(id_tarifa)
+    if id_habitacion is not None:
+        conditions.append("au.id_habitacion = :id_habitacion")
+        binds["id_habitacion"] = int(id_habitacion)
+
+    binds["limite"] = max(1, min(int(limite), 500))
+    where_clause = "\n           AND ".join(conditions)
+    if where_clause:
+        where_clause = "AND " + where_clause
+
+    rows = fetch_all(
+        f"""
+        SELECT id_auditoria,
+               fecha_cambio,
+               usuario_bd,
+               operacion,
+               id_tarifa,
+               id_habitacion,
+               habitacion,
+               alojamiento,
+               municipio,
+               id_temporada,
+               temporada,
+               valor_anterior,
+               valor_nuevo,
+               variacion
+          FROM (
+              SELECT au.id_auditoria,
+                     au.fecha_cambio,
+                     au.usuario_bd,
+                     au.operacion,
+                     au.id_tarifa,
+                     au.id_habitacion,
+                     h.numero AS habitacion,
+                     a.nombre AS alojamiento,
+                     m.nombre AS municipio,
+                     au.id_temporada,
+                     t.nombre AS temporada,
+                     au.valor_anterior,
+                     au.valor_nuevo,
+                     CASE
+                         WHEN au.valor_anterior IS NOT NULL
+                          AND au.valor_nuevo IS NOT NULL
+                         THEN au.valor_nuevo - au.valor_anterior
+                     END AS variacion
+                FROM auditoria_tarifa au
+                LEFT JOIN habitacion h
+                  ON h.id_habitacion = au.id_habitacion
+                LEFT JOIN alojamiento a
+                  ON a.id_alojamiento = h.id_alojamiento
+                LEFT JOIN municipio m
+                  ON m.id_municipio = a.id_municipio
+                LEFT JOIN temporada t
+                  ON t.id_temporada = au.id_temporada
+               WHERE 1 = 1
+                 {where_clause}
+               ORDER BY au.fecha_cambio DESC, au.id_auditoria DESC
+          )
+         WHERE ROWNUM <= :limite
+        """,
+        binds,
+    )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "id_auditoria",
+            "fecha_cambio",
+            "usuario_bd",
+            "operacion",
+            "id_tarifa",
+            "id_habitacion",
+            "habitacion",
+            "alojamiento",
+            "municipio",
+            "id_temporada",
+            "temporada",
+            "valor_anterior",
+            "valor_nuevo",
+            "variacion",
+        ],
+    )
+
+
+def obtener_resumen_auditoria(data: pd.DataFrame) -> dict[str, int]:
+    if data.empty:
+        return {
+            "registros": 0,
+            "insert": 0,
+            "update": 0,
+            "delete": 0,
+            "usuarios": 0,
+        }
+    operation_counts = data["operacion"].value_counts()
+    return {
+        "registros": len(data),
+        "insert": int(operation_counts.get("INSERT", 0)),
+        "update": int(operation_counts.get("UPDATE", 0)),
+        "delete": int(operation_counts.get("DELETE", 0)),
+        "usuarios": int(data["usuario_bd"].nunique()),
+    }
+
+
+def obtener_estado_trigger_auditoria() -> dict[str, Any]:
+    row = fetch_one(
+        """
+        SELECT object_name AS nombre,
+               object_type AS tipo,
+               status AS estado
+          FROM user_objects
+         WHERE object_name = 'TRG_AUDITORIA_TARIFA'
+           AND object_type = 'TRIGGER'
+        """
+    )
+    return row or {
+        "nombre": "TRG_AUDITORIA_TARIFA",
+        "tipo": "TRIGGER",
+        "estado": "NO EXISTE",
+    }
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def obtener_estado_sistema() -> pd.DataFrame:
     rows = fetch_all(
